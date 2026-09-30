@@ -1,8 +1,6 @@
 """
-test_speculative_streaming.py - correctness check: speculative decoding +
-streaming cache must match a streaming baseline (target model alone, same
-eviction policy) - NOT the unbounded baseline, which is a different system
-once eviction is involved.
+test_speculative_streaming.py - actually runs the per-token eviction fix,
+rather than reasoning about whether it would work.
 """
 
 import torch
@@ -30,10 +28,10 @@ def main():
     run_streaming_baseline(target_model, tokenizer, "Warmup.", 10, device, N_SINK, N_WINDOW)
     speculative_decode_streaming(draft_model, target_model, tokenizer, "Warmup.", 10, K, device, N_SINK, N_WINDOW)
 
-    print(f"\nrunning streaming baseline ({MAX_NEW_TOKENS} tokens, window={N_WINDOW})...")
+    print(f"\nrunning streaming baseline (window={N_WINDOW}, {MAX_NEW_TOKENS} tokens)...")
     baseline_result = run_streaming_baseline(target_model, tokenizer, PROMPT, MAX_NEW_TOKENS, device, N_SINK, N_WINDOW)
 
-    print(f"running speculative + streaming (k={K})...")
+    print(f"running speculative + streaming with PER-TOKEN eviction (k={K})...")
     spec_result = speculative_decode_streaming(draft_model, target_model, tokenizer, PROMPT, MAX_NEW_TOKENS, K, device, N_SINK, N_WINDOW)
 
     match = baseline_result["generated_text"] == spec_result["generated_text"]
