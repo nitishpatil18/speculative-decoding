@@ -2,18 +2,33 @@
 speculative_streaming.py - speculative decoding with a bounded (StreamingLLM)
 kv-cache on the target model.
 
-SCOPE NOTE: "correctness" here means identical output to run_streaming_baseline()
-- the target model running standalone under the SAME eviction policy - not
-identical to the unbounded baseline used elsewhere in this project. Eviction
-changes the model's effective context regardless of speculative decoding;
-that's a separate, already-quantified cost (see evaluate_quality.py, +15.2%
-perplexity post-eviction). This file only has to prove speculative decoding
-doesn't add further divergence ON TOP of that.
+SCOPE NOTE: "correctness" means identical output to run_streaming_baseline()
+- the target model alone under the same eviction policy - not the unbounded
+baseline. Eviction itself already changes context regardless of speculative
+decoding (see evaluate_quality.py, +15.2% perplexity post-eviction); this
+file only has to prove speculative decoding adds no FURTHER divergence.
 
-Draft model's cache is NOT evicted - it resets to None on every rejection
-anyway (see speculative_decode.py), so its cache never grows large enough
-for eviction to matter, and its own position_ids can keep using the default
-cache-length-based computation safely.
+BUG HISTORY (both wrong theories kept here since they ruled out real
+possibilities and the next person debugging this should not re-waste time
+on them):
+  1. WRONG: "position tracker desync" - checking the actual trace showed
+     tracker positions and cache lengths were both correct and consistent.
+  2. PARTIALLY WRONG: "transient overshoot during batched verification,
+     fixable by shrinking the eviction cap by k" - shrinking the cap did
+     NOT fix the divergence (it just moved earlier, position 54 -> 40),
+     proving capacity was never the issue.
+
+ACTUAL CAUSE: eviction GRANULARITY, not capacity. The streaming baseline
+evicts after EVERY SINGLE TOKEN (one eviction op per token). A speculative
+round adds 1-3 tokens in one batch, then evicts ONCE for the whole batch.
+Evicting once after 3 tokens does not equal evicting 3 times, once after
+each token, whenever the window boundary falls inside that span - "the
+last n_window entries as of now" differs depending on whether you check
+that after every token or only after a multi-token batch.
+
+FIX: loop the eviction call once per token actually added this round,
+replicating the baseline's exact per-token cadence, instead of one
+eviction call per round regardless of how many tokens landed.
 """
 
 import time
@@ -69,6 +84,19 @@ def run_streaming_baseline(model, tokenizer, prompt, max_new_tokens, device, n_s
     }
 
 
+def evict_streaming_per_token(cache, n_sink, n_window, num_tokens_added):
+    """
+    Calls evict_streaming once per token in num_tokens_added, matching the
+    baseline's exact per-token cadence - NOT one call covering all tokens
+    at once, which is mathematically different once more than 1 token
+    lands in a single round. Each call only meaningfully changes anything
+    once total length exceeds n_sink+n_window; calling it "too early" is a
+    harmless no-op (see evict_streaming's own seq_len <= max_len check).
+    """
+    for _ in range(num_tokens_added):
+        evict_streaming(cache, n_sink=n_sink, n_window=n_window)
+
+
 def speculative_decode_streaming(draft_model, target_model, tokenizer, prompt, max_new_tokens, k, device, n_sink, n_window):
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
@@ -85,7 +113,7 @@ def speculative_decode_streaming(draft_model, target_model, tokenizer, prompt, m
             prime_out = target_model(input_ids=input_ids[:, :-1], position_ids=prime_position_ids, use_cache=True)
             target_past = prime_out.past_key_values
             tracker.advance(input_ids.shape[1] - 1)
-            evict_streaming(target_past, n_sink=n_sink, n_window=n_window)
+            evict_streaming_per_token(target_past, n_sink, n_window, input_ids.shape[1] - 1)
         else:
             target_past = None
 
@@ -134,9 +162,10 @@ def speculative_decode_streaming(draft_model, target_model, tokenizer, prompt, m
 
             new_target_past = out.past_key_values
             valid_length = new_target_past.get_seq_length() - (k - num_accepted)
-            new_target_past.crop(valid_length)  # correctness: drop rejected-token cache entries
-            tracker.advance(num_accepted + 1)
-            evict_streaming(new_target_past, n_sink=n_sink, n_window=n_window)  # THEN bound memory
+            new_target_past.crop(valid_length)
+            real_tokens_this_round = num_accepted + 1
+            tracker.advance(real_tokens_this_round)
+            evict_streaming_per_token(new_target_past, n_sink, n_window, real_tokens_this_round)
             target_past = new_target_past
 
             step_times.append(time.perf_counter() - round_start)
@@ -168,127 +197,3 @@ def speculative_decode_streaming(draft_model, target_model, tokenizer, prompt, m
         "acceptance_rate": avg_acceptance / k,
         "num_rounds": len(accepted_lengths),
     }
-
-
-def run_streaming_baseline_with_logit_capture(model, tokenizer, prompt, max_new_tokens, device, n_sink, n_window, capture_at_step):
-    """
-    Identical to run_streaming_baseline, but captures the full logit vector
-    at one specific step, for debugging a specific divergence point using
-    the ACTUAL incremental state at that point - not a reconstruction.
-    """
-    cache = DynamicCache()
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    generated = input_ids
-    tracker = StreamingPositionTracker(start=0)
-    captured_logits = None
-
-    with torch.no_grad():
-        position_ids = tracker.position_ids(generated.shape[1], device)
-        out = model(input_ids=generated, position_ids=position_ids, past_key_values=cache, use_cache=True)
-        tracker.advance(generated.shape[1])
-        cache = out.past_key_values
-        evict_streaming(cache, n_sink=n_sink, n_window=n_window)
-        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        generated = torch.cat([generated, next_token], dim=1)
-
-        for step in range(max_new_tokens - 1):
-            position_ids = tracker.position_ids(1, device)
-            out = model(input_ids=next_token, position_ids=position_ids, past_key_values=cache, use_cache=True)
-            tracker.advance(1)
-            cache = out.past_key_values
-            evict_streaming(cache, n_sink=n_sink, n_window=n_window)
-
-            if step == capture_at_step:
-                captured_logits = out.logits[0, -1, :].clone()
-
-            next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_token], dim=1)
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-
-    return generated[0].tolist(), captured_logits
-
-
-def speculative_decode_streaming_debug(draft_model, target_model, tokenizer, prompt, max_new_tokens, k, device, n_sink, n_window, stop_at_tokens_generated):
-    """
-    Identical to speculative_decode_streaming, but prints cache occupancy and
-    tracker position every round, and stops early once tokens_generated
-    passes stop_at_tokens_generated - for inspecting exactly what state the
-    system is in right as a known divergence point is approached.
-    """
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-
-    draft_past = None
-    prompt_len = input_ids.shape[1]
-    tokens_generated = 0
-    tracker = StreamingPositionTracker(start=0)
-
-    with torch.no_grad():
-        if input_ids.shape[1] > 1:
-            prime_position_ids = tracker.position_ids(input_ids.shape[1] - 1, device)
-            prime_out = target_model(input_ids=input_ids[:, :-1], position_ids=prime_position_ids, use_cache=True)
-            target_past = prime_out.past_key_values
-            tracker.advance(input_ids.shape[1] - 1)
-            evict_streaming(target_past, n_sink=n_sink, n_window=n_window)
-        else:
-            target_past = None
-
-        round_num = 0
-        while tokens_generated < max_new_tokens:
-            round_num += 1
-            draft_tokens = []
-            draft_input = input_ids if draft_past is None else input_ids[:, -1:]
-
-            for _ in range(k):
-                out = draft_model(input_ids=draft_input, past_key_values=draft_past, use_cache=True)
-                draft_past = out.past_key_values
-                next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                draft_tokens.append(next_token)
-                draft_input = next_token
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-
-            draft_tokens_tensor = torch.cat(draft_tokens, dim=1)
-            verify_input = input_ids[:, -(k + 1):]
-            verify_position_ids = tracker.position_ids(k + 1, device)
-
-            print(f"round {round_num}: tokens_generated={tokens_generated}, cache_len_before={target_past.get_seq_length() if target_past else 0}, tracker_pos_before={tracker.true_position}, verify_position_ids={verify_position_ids.tolist()}")
-
-            out = target_model(input_ids=verify_input, position_ids=verify_position_ids, past_key_values=target_past, use_cache=True)
-            target_tokens = out.logits.argmax(dim=-1)
-
-            num_accepted = 0
-            for i in range(k):
-                if target_tokens[0, i].item() == draft_tokens_tensor[0, i].item():
-                    num_accepted += 1
-                else:
-                    break
-
-            if num_accepted < k:
-                input_ids = input_ids[:, : input_ids.shape[1] - k + num_accepted]
-                correction_token = target_tokens[0, num_accepted].unsqueeze(0).unsqueeze(0)
-                input_ids = torch.cat([input_ids, correction_token], dim=1)
-                tokens_generated += num_accepted + 1
-                draft_past = None
-                print(f"  REJECTION at round {round_num}: num_accepted={num_accepted}/{k}")
-            else:
-                bonus_token = target_tokens[0, k].unsqueeze(0).unsqueeze(0)
-                input_ids = torch.cat([input_ids, bonus_token], dim=1)
-                tokens_generated += k + 1
-
-            new_target_past = out.past_key_values
-            cache_len_before_crop = new_target_past.get_seq_length()
-            valid_length = new_target_past.get_seq_length() - (k - num_accepted)
-            new_target_past.crop(valid_length)
-            cache_len_after_crop = new_target_past.get_seq_length()
-            tracker.advance(num_accepted + 1)
-            evict_streaming(new_target_past, n_sink=n_sink, n_window=n_window)
-            cache_len_after_evict = new_target_past.get_seq_length()
-            target_past = new_target_past
-
-            print(f"  cache: before_crop={cache_len_before_crop}, after_crop={cache_len_after_crop}, after_evict={cache_len_after_evict}, tracker_pos_after={tracker.true_position}")
-
-            if tokens_generated >= stop_at_tokens_generated:
-                print(f"\nstopping at tokens_generated={tokens_generated} (requested stop point)")
-                break
-
-    return input_ids[0].tolist()
