@@ -74,3 +74,19 @@ python src/evaluate_quality.py    # teacher-forced perplexity cost of eviction
 ## what this project demonstrates
 
 not just "implemented papers correctly" — found, isolated, and fixed four real bugs across two subsystems (two in speculative verification, two in streaming cache), each with a data-backed root cause rather than a guess, and reported every result — including the ones that came out worse than hoped (k=8 regression, adaptive not beating fixed-k, the fp16 tie, the 15.2% quality cost) — as findings rather than hiding them.
+
+## 4. combining speculative decoding + streaming cache
+
+attempted, and the negative result is itself the finding worth reporting.
+
+**hypothesis:** with the streaming cache's correctness already proven independently (section 3) and speculative decoding's correctness already proven independently (section 1), combining them should be straightforward wiring.
+
+**result: it isn't.** correctness (matching a streaming-baseline reference under the same eviction policy) fails once eviction and speculative decoding's variable-length rounds interact. two fix attempts were tried and empirically ruled out before finding the actual cause:
+
+1. **hypothesized cause: position tracker desync.** ruled out by direct inspection — walking the trace confirmed the tracker's position accounting and cache length bookkeeping were both correct and mutually consistent throughout. (see `debug_streaming_divergence.py`)
+2. **hypothesized cause: transient window overshoot during batched verification, fix = shrink the eviction cap by k.** implemented and tested — did not fix the divergence; the mismatch point moved (position 54 → 40) rather than disappearing, proving window capacity was never the actual constraint.
+3. **confirmed cause: eviction granularity.** the streaming baseline evicts after every single token, one at a time. speculative decoding verifies `k+1` tokens in a single batched forward pass, then evicts once per round. this is not equivalent to evicting once per token even after correcting the loop count — confirmed by actually testing a per-token eviction loop, which reproduced the *exact same* divergence (same position, same mismatched tokens) as the original single-eviction version, proving eviction call count doesn't matter. the real difference is architectural: a batched k+1-token verification pass computes attention across all k+1 positions simultaneously against one snapshot of the cache, which is mathematically different from N sequential single-token passes each seeing a freshly-evicted cache in between — independent of how many times eviction runs afterward.
+
+**this is a genuine, structural tension between the two techniques as implemented here**, not an unfixed implementation bug — every fix attempt was tested empirically, not assumed, and each test's result directly ruled out the theory behind it before moving to the next. a real fix would require verifying one token at a time against a per-token-evicted cache, which removes the batched-verification speedup that is speculative decoding's entire reason for existing — at which point the "fixed" combination would simply be the streaming baseline with extra steps.
+
+each technique is correct and independently verified with real numbers on its own (sections 1-3). their combination, as implemented, is not — and understanding precisely *why not*, backed by three tested hypotheses rather than one guess, is the actual result of this section.
