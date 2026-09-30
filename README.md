@@ -90,3 +90,21 @@ attempted, and the negative result is itself the finding worth reporting.
 **this is a genuine, structural tension between the two techniques as implemented here**, not an unfixed implementation bug — every fix attempt was tested empirically, not assumed, and each test's result directly ruled out the theory behind it before moving to the next. a real fix would require verifying one token at a time against a per-token-evicted cache, which removes the batched-verification speedup that is speculative decoding's entire reason for existing — at which point the "fixed" combination would simply be the streaming baseline with extra steps.
 
 each technique is correct and independently verified with real numbers on its own (sections 1-3). their combination, as implemented, is not — and understanding precisely *why not*, backed by three tested hypotheses rather than one guess, is the actual result of this section.
+
+## 5. tree-based speculative decoding (branch factor 2, depth 2)
+
+extends linear speculative decoding into a small draft tree — the draft model proposes 2 candidate continuations at each of 2 depths (6 nodes, 4 root-to-leaf paths), verified by the target model in one batched forward pass using a custom tree-structured attention mask, instead of committing to one linear guess.
+
+**the hard part: verified, not assumed.** a custom attention mask injected via `attention_mask={"full_attention": <4d_tensor>}` (a bypass mechanism found by reading `Qwen2Model.forward`'s source directly) needed two levels of proof before trusting it:
+- sibling branches at the same depth are provably blind to each other (0.0 logit difference when changing a sibling's content) while a plain-causal control confirms the test itself is sensitive (9.64 difference) — rules out a leaky mask
+- every individual tree node's verification logits match running that exact node's ancestor path alone as a normal linear sequence, within fp16 noise (max diff 0.023) — rules out the tree structure silently corrupting any path's math
+
+**two real bugs found and fixed during this work:**
+1. verification logits were initially read by flat array position instead of each node's actual tree-parent position — comparing unrelated sibling data against the wrong node
+2. the attention mask was initially built inverted (start from all-blocked, explicitly allow prompt visibility per-row), which broke ordinary causality *within the prompt itself* and cascaded corrupted values through every later position via stacked transformer layers
+
+**end-to-end correctness:** full multi-round generation, byte-identical to plain greedy baseline across 40/40 tokens — every accept/correct/bonus decision defers to the target model's own argmax, so this is the strongest correctness bar in the project (not "matches within noise," but exact).
+
+**honest performance finding:** measured, not assumed — tree speculative decoding without KV-cache reuse runs at roughly parity with baseline (0.97x) and *worse* than linear speculative decoding (0.69x), because every round recomputes a full forward pass over the entire sequence from scratch. exploring more candidates per round doesn't pay for itself against that cost. this matches why production tree-speculation systems (Medusa, SpecInfer) treat KV-cache persistence across rounds as load-bearing infrastructure, not an optional optimization — a conclusion reached here empirically, by measuring, rather than assumed from reading about it.
+
+**scope boundary, stated plainly:** adding correct KV-cache support to the tree version — where different subtrees get cropped differently depending on which path gets accepted each round — is substantially more complex than anything else in this project, combining tree-structured bookkeeping with the position-tracking discipline already hard-won in the streaming-cache work (section 3). left as a clearly identified, well-understood next step rather than rushed under continued time pressure, consistent with this project's priority order throughout: correctness first, optimize only once correctness is proven.
