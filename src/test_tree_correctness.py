@@ -1,12 +1,6 @@
 """
 test_tree_correctness.py - proves tree-batched verification produces
 IDENTICAL logits to running each path linearly and alone.
-
-Fixed the same conceptual bug in the LINEAR comparison side: the logit
-that verifies token at depth_pos in a path is read from the position of
-ITS PARENT (prompt_len - 1 + depth_pos for a genuinely linear chain,
-where parent always happens to be physically adjacent) - made explicit
-here rather than implicitly assumed.
 """
 
 import torch
@@ -33,7 +27,7 @@ def main():
     for i, n in enumerate(nodes):
         print(f"  node {i}: token={tokenizer.decode([n['token_id']])!r}, parent={n['parent']}, depth={n['depth']}")
 
-    tree_verify_logits = verify_tree(target_model, input_ids, nodes, device)
+    tree_verify_logits, _ = verify_tree(target_model, input_ids, nodes, device)
 
     print(f"\nchecking each node's VERIFICATION logit against a plain linear run of its path...")
     max_diff_overall = 0.0
@@ -46,8 +40,6 @@ def main():
             out_linear = target_model(input_ids=linear_input, use_cache=False)
 
         for depth_pos, node_idx in enumerate(path):
-            # verifying logit for the token at depth_pos is read from its
-            # PARENT's position: prompt_len - 1 + depth_pos, for a linear chain
             linear_verify_pos = prompt_len - 1 + depth_pos
             linear_logits = out_linear.logits[0, linear_verify_pos, :]
             tree_logits = tree_verify_logits[node_idx, :]

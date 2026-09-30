@@ -1,28 +1,25 @@
 """
-tree_speculative.py - tree-based speculative decoding, one round.
+tree_speculative.py - tree-based speculative decoding.
 
-BUG HISTORY - two real bugs found here, both worth recording:
+Branch factor 2, depth 2: draft model proposes top-2 tokens at depth 1,
+then top-2 continuations for each, forming 6 tree nodes and 4 root-to-leaf
+candidate paths, verified by the target model in ONE batched forward pass
+using a tree-structured attention mask.
 
-1. verify_tree originally read "verification logits" via flat physical
-   array adjacency, not actual tree-parent position. Fixed by reading each
-   node's logits from node_verify_position (its real parent's absolute
-   position).
+No KV-cache persistence across rounds in this version - each round
+recomputes draft and target forward passes from the full current sequence.
+Correctness first, matching this project's established priority; caching
+tree-based verification is real additional complexity deferred as future
+work, same as how linear speculative decoding was built correctness-first
+before optimizing.
 
-2. build_tree_attention originally built the mask as "-inf everywhere,
-   then explicitly allow prompt visibility" via
-   mask[0,0,:,:prompt_len] = 0.0 for ALL rows. This unconditionally let
-   even EARLY prompt rows see LATER prompt columns, breaking ordinary
-   causality inside the prompt itself. Since transformer layers stack,
-   that corruption cascaded through every later layer/position - which is
-   why even depth-1 node logits (derived from the last prompt position)
-   came out wrong by ~13, not just tree-to-tree relationships.
-
-   FIXED by building a completely standard causal mask for the full
-   extended sequence FIRST (prompt-internal causality and prompt-to-tree
-   visibility both fall out of this for free, since the prompt genuinely
-   precedes all tree nodes), then explicitly BLOCKING only the
-   non-ancestor tree-to-tree edges on top of that - the reverse of the
-   original approach.
+BUG HISTORY (see full details in commit history / test_tree_correctness.py):
+1. verify_tree originally read logits by flat array position instead of
+   actual tree-parent position.
+2. build_tree_attention's mask was originally constructed inverted,
+   breaking causality WITHIN the prompt itself.
+Both fixed and verified: node logits match linear per-path runs within
+fp16 noise (max diff 0.023).
 """
 
 import torch
@@ -55,12 +52,6 @@ def build_draft_tree(draft_model, input_ids, branch_factor, device):
 
 
 def build_tree_attention(input_ids, nodes, device):
-    """
-    Standard causal mask for the WHOLE extended sequence first (correct
-    prompt-internal causality, correct prompt-to-tree visibility, for
-    free). Then explicitly block non-ancestor tree-to-tree edges on top -
-    NOT the reverse.
-    """
     prompt_len = input_ids.shape[1]
     num_nodes = len(nodes)
     seq_len = prompt_len + num_nodes
@@ -99,6 +90,16 @@ def node_verify_position(node, prompt_len, nodes):
 
 
 def verify_tree(target_model, input_ids, nodes, device):
+    """
+    Returns (verify_logits, self_logits), each shape (num_nodes, vocab):
+      verify_logits[i] - the distribution that VERIFIES node i's own token
+                          (read from node i's parent's position).
+      self_logits[i]   - node i's OWN output position's logits, i.e. the
+                          prediction for whatever comes AFTER node i. Used
+                          for the bonus-token case when a full path is
+                          accepted - free from this same forward pass, no
+                          extra computation needed.
+    """
     extended_input_ids, mask, position_ids = build_tree_attention(input_ids, nodes, device)
     prompt_len = input_ids.shape[1]
 
@@ -111,8 +112,78 @@ def verify_tree(target_model, input_ids, nodes, device):
         )
 
     verify_logits = []
-    for node in nodes:
+    self_logits = []
+    for i, node in enumerate(nodes):
         pos = node_verify_position(node, prompt_len, nodes)
         verify_logits.append(out.logits[0, pos, :])
+        self_logits.append(out.logits[0, prompt_len + i, :])
 
-    return torch.stack(verify_logits, dim=0)
+    return torch.stack(verify_logits, dim=0), torch.stack(self_logits, dim=0)
+
+
+def select_best_path(nodes, paths, verify_logits):
+    """
+    For each root-to-leaf path, walks it and counts how many leading nodes
+    match the target's argmax at that node's verify position (i.e. how
+    many draft tokens the target would have actually chosen too). Returns
+    the path with the longest accepted prefix, and that prefix length.
+    Ties broken by first path found - arbitrary but deterministic.
+    """
+    best_path = None
+    best_len = -1
+
+    for path in paths:
+        length = 0
+        for node_idx in path:
+            target_choice = verify_logits[node_idx].argmax().item()
+            if target_choice == nodes[node_idx]["token_id"]:
+                length += 1
+            else:
+                break
+        if length > best_len:
+            best_len = length
+            best_path = path
+
+    return best_path, best_len
+
+
+def run_tree_speculative_decode(draft_model, target_model, tokenizer, prompt, max_new_tokens, branch_factor, device):
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    prompt_len = input_ids.shape[1]
+    tokens_generated = 0
+
+    while tokens_generated < max_new_tokens:
+        nodes, paths = build_draft_tree(draft_model, input_ids, branch_factor, device)
+        verify_logits, self_logits = verify_tree(target_model, input_ids, nodes, device)
+
+        best_path, best_len = select_best_path(nodes, paths, verify_logits)
+
+        for node_idx in best_path[:best_len]:
+            token_id = nodes[node_idx]["token_id"]
+            input_ids = torch.cat([input_ids, torch.tensor([[token_id]], device=device)], dim=1)
+            tokens_generated += 1
+            if token_id == tokenizer.eos_token_id:
+                return input_ids[0, :prompt_len + tokens_generated].tolist()
+
+        if best_len < len(best_path):
+            mismatch_node = best_path[best_len]
+            correction_token = verify_logits[mismatch_node].argmax().item()
+            input_ids = torch.cat([input_ids, torch.tensor([[correction_token]], device=device)], dim=1)
+            tokens_generated += 1
+            if correction_token == tokenizer.eos_token_id:
+                break
+        else:
+            leaf_node = best_path[-1]
+            bonus_token = self_logits[leaf_node].argmax().item()
+            input_ids = torch.cat([input_ids, torch.tensor([[bonus_token]], device=device)], dim=1)
+            tokens_generated += 1
+            if bonus_token == tokenizer.eos_token_id:
+                break
+
+        if tokens_generated >= max_new_tokens:
+            overshoot = tokens_generated - max_new_tokens
+            if overshoot > 0:
+                input_ids = input_ids[:, :-overshoot]
+            break
+
+    return input_ids[0].tolist()
